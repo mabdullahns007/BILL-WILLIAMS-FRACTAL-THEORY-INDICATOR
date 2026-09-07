@@ -1,0 +1,476 @@
+// built with PineScript Agents by TradersPost
+//@version=6
+//
+// Bill Williams - Fractal Theory Strategy (Profitunity five dimensions)
+// ===========================================================================
+// Rules sourced from the OKF knowledge bundle `OKF/fractal-theory`, ingested
+// from Bill Williams' talk "The Practical Fractal: The Holy Grail to Trading"
+// (https://www.youtube.com/watch?v=bNxt298VVOw). The companion indicator is
+// `bw-fractal-theory-indicator.pine` - identical engine, no orders.
+//
+// HOW THE STRATEGY TRADES
+//   ENTRY   A resting BUY STOP one tick above the most recent unbroken up
+//           fractal (SELL STOP one tick below the most recent unbroken down
+//           fractal). Williams is explicit that this is by construction the
+//           worst trade location and the maximum risk on that entry - the
+//           point is never to be left out of a genuine trend. The order is
+//           re-placed every bar at the current fractal, so it behaves exactly
+//           like a resting order rather than a next-bar market fill.
+//   FILTER  Optionally require the other four dimensions - balance line,
+//           momentum, momentum direction, accelerator - to agree before the
+//           stop is placed. Only the balance line is required by default.
+//   ADD     Williams pyramids one unit per successive fractal breakout in the
+//           direction of the trend (the yen case study ends with 6 longs).
+//           Each fill consumes its fractal, so the next add needs a NEW one.
+//   STOP    concepts/stop-placement-rule.md: the SECOND-most-recent opposite
+//           fractal; where that sits closer to price than the most recent one,
+//           whichever of the two is furthest from price. It ratchets with new
+//           fractals and never loosens. Where no opposite fractal is on the
+//           protective side of price (the chop case logged in the wiki on
+//           2026-08-29) it falls back to the nearest valid one, then to ATR.
+//   EXIT    concepts/five-magic-bullets.md: when all five dimensions stand
+//           against the open position, the trend is dead - close everything.
+//           An optional R-multiple target is provided but OFF by default:
+//           Williams runs winners and judges the method on money made, not
+//           on win rate (concepts/win-loss-ratio-fallacy.md).
+//
+// WHERE THE SOURCE IS AMBIGUOUS (same notes as the indicator):
+//   * Accelerator: the wiki reads "5-bar moving average of the momentum
+//     oscillator"; Williams' published Accelerator is AO - SMA(AO,5). Both
+//     are selectable, the published form is the default.
+//   * Fractals allow tied/extra bars provided nothing in the window exceeds
+//     the centre bar (default); a strict pivot mode is provided.
+//   * Squats / greens / fades / fakes are named but never defined in the
+//     source talk, so they are not implemented rather than guessed at.
+//
+// PANE LAYOUT: the home pane is the oscillator pane; the price-chart layer is
+// force-overlaid. Alert payloads are TradersPost JSON - set the ticker and
+// quantity in the "TradersPost alerts" group, then use
+// {{strategy.order.alert_message}} as the alert message.
+// ===========================================================================
+
+strategy("[TradersPost] BW Fractal Theory Strategy",
+     shorttitle="BW Fractal Strat",
+     overlay=false,
+     pyramiding=20,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     initial_capital=100000,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.0,
+     slippage=1,
+     calc_on_every_tick=false,
+     max_bars_back=500)
+//@strategy_alert_message {{strategy.order.alert_message}}
+
+// ===========================================================================
+// INPUTS
+// ===========================================================================
+
+grpFrac = "1. Fractals (space dimension)"
+fractalLen = input.int(2, "Bars either side of the fractal",
+     minval=1, maxval=20, group=grpFrac,
+     tooltip="Williams' fractal is the 5-bar 'five-fingered boogie': 2 bars either side of the centre bar. Raising this makes fractals rarer and slower to confirm.")
+allowTies = input.bool(true, "Allow tied / extra bars", group=grpFrac,
+     tooltip="ON (source-faithful): valid as long as nothing in the window on either side EXCEEDS the centre bar. OFF: strict pivot.")
+entryTicks = input.int(1, "Entry buffer (ticks beyond the fractal)",
+     minval=0, maxval=100, group=grpFrac,
+     tooltip="Williams places the stop order one tick beyond the fractal.")
+maxStored = input.int(50, "Fractals kept per side", minval=4, maxval=200, group=grpFrac)
+
+grpBal = "2. Balance line (strange attractor)"
+blSrc = input.source(hl2, "Balance line source", group=grpBal)
+blLen = input.int(13, "Balance line length", minval=1, maxval=200, group=grpBal)
+blOffset = input.int(8, "Forward offset (bars)", minval=0, maxval=100, group=grpBal,
+     tooltip="Williams pushes the 13-bar average 8 bars into the future. Signal logic compares price against the value DISPLAYED at the current bar.")
+blType = input.string("SMMA (RMA)", "Smoothing", options=["SMMA (RMA)", "SMA", "EMA"], group=grpBal)
+
+grpMom = "3-5. Momentum & accelerator"
+aoSrc = input.source(hl2, "Oscillator source", group=grpMom)
+aoFast = input.int(5, "Momentum fast SMA", minval=1, maxval=100, group=grpMom)
+aoSlow = input.int(34, "Momentum slow SMA", minval=2, maxval=300, group=grpMom)
+acMode = input.string("AO - SMA(AO, 5)", "Accelerator formula",
+     options=["AO - SMA(AO, 5)", "SMA(AO, 5)"], group=grpMom,
+     tooltip="'AO - SMA(AO,5)' is Williams' published Accelerator. 'SMA(AO,5)' is the literal reading of the talk's wording.")
+acLen = input.int(5, "Accelerator length", minval=1, maxval=100, group=grpMom)
+acUseSlope = input.bool(false, "Judge accelerator by slope, not zero line", group=grpMom)
+
+grpEntry = "Entries"
+allowLongs = input.bool(true, "Longs", group=grpEntry, inline="dir")
+allowShorts = input.bool(true, "Shorts", group=grpEntry, inline="dir")
+qtyPerUnit = input.float(1.0, "Contracts / shares per unit", minval=0.000001, step=0.1, group=grpEntry,
+     tooltip="Size of ONE fractal breakout entry. Williams adds one unit per successive breakout.")
+maxUnits = input.int(6, "Maximum units (pyramid depth)", minval=1, maxval=20, group=grpEntry,
+     tooltip="The yen case study in the talk ends the move holding 6 long units.")
+allowReverse = input.bool(false, "Allow stop-and-reverse", group=grpEntry,
+     tooltip="OFF: opposite-side stop orders are cancelled while a position is open. ON: an opposite fractal breakout flips the position.")
+
+grpFilter = "Dimension filters"
+useBalFilter = input.bool(true, "Require balance-line agreement", group=grpFilter,
+     tooltip="Buy stops only while price is above the displayed balance line; sell stops only below it.")
+useMomFilter = input.bool(false, "Require momentum agreement", group=grpFilter)
+useMomDirFilter = input.bool(false, "Require momentum DIRECTION agreement", group=grpFilter)
+useAccFilter = input.bool(false, "Require accelerator agreement", group=grpFilter)
+
+grpExit = "Exits"
+bulletsRequired = input.int(5, "Dimensions against = exit (magic bullets)",
+     minval=2, maxval=5, group=grpExit,
+     tooltip="Williams' 'five magic bullets': all five dimensions reversed. Lower it for an earlier, looser exit.")
+useBulletExit = input.bool(true, "Exit on magic bullets", group=grpExit)
+trailStops = input.bool(true, "Ratchet the stop with new fractals", group=grpExit,
+     tooltip="Re-reads the two-fractals-back rule every bar and moves the stop only in the favourable direction.")
+atrLen = input.int(14, "ATR length (stop fallback)", minval=1, maxval=100, group=grpExit)
+atrMult = input.float(2.0, "ATR multiple (stop fallback)", minval=0.1, maxval=10.0, step=0.1, group=grpExit,
+     tooltip="Used only when no opposite fractal sits on the protective side of price.")
+useTarget = input.bool(false, "Use an R-multiple target", group=grpExit,
+     tooltip="OFF by default: Williams runs winners and explicitly rejects optimising for win rate.")
+targetR = input.float(3.0, "Target (R multiple)", minval=0.5, maxval=50.0, step=0.5,
+     group=grpExit, active=useTarget)
+
+grpTime = "Backtest window"
+useDateFilter = input.bool(false, "Limit to a date range", group=grpTime)
+startDate = input.time(timestamp("1 Jan 2015 00:00 +0000"), "Start", group=grpTime, active=useDateFilter)
+endDate = input.time(timestamp("1 Jan 2035 00:00 +0000"), "End", group=grpTime, active=useDateFilter)
+
+grpTP = "TradersPost alerts"
+tpTicker = input.string("", "Ticker override", group=grpTP,
+     tooltip="Leave blank to send the chart symbol. Set it when the broker symbol differs from the TradingView symbol.")
+tpQty = input.string("", "Quantity field", group=grpTP,
+     tooltip="Leave blank to omit quantity and let TradersPost size the order.")
+
+grpVis = "Display"
+showFractals = input.bool(true, "Fractal markers", group=grpVis)
+showLevels = input.bool(true, "Resting stop-order levels", group=grpVis)
+showBalance = input.bool(true, "Balance line", group=grpVis)
+showStop = input.bool(true, "Active protective stop", group=grpVis)
+showMom = input.bool(true, "Momentum histogram", group=grpVis)
+showAcc = input.bool(true, "Accelerator histogram", group=grpVis)
+upCol = input.color(color.new(#26a69a, 0), "Bullish", group=grpVis, inline="c1")
+dnCol = input.color(color.new(#ef5350, 0), "Bearish", group=grpVis, inline="c1")
+balCol = input.color(color.new(#2962ff, 0), "Balance line", group=grpVis)
+stopCol = input.color(color.new(#ff9800, 0), "Protective stop", group=grpVis)
+
+// ===========================================================================
+// TYPES
+// ===========================================================================
+
+// A confirmed fractal. `tstamp` is kept alongside `barIndex` so the level can
+// be addressed by time (no 5000-bar lookback ceiling) by downstream tooling.
+type Fractal
+    float level
+    int   barIndex
+    int   tstamp
+    bool  broken
+
+// ===========================================================================
+// FRACTAL ENGINE
+// ===========================================================================
+
+//@function Tests whether a fractal completed `len` bars back.
+detectFractal(int len, bool up, bool ties) =>
+    float c = up ? high[len] : low[len]
+    bool exceeded = false
+    bool tied = false
+    bool strictLeft = false
+    bool strictRight = false
+    for i = 1 to len
+        float l = up ? high[len + i] : low[len + i]
+        float r = up ? high[len - i] : low[len - i]
+        if up
+            if l > c or r > c
+                exceeded := true
+            if l == c or r == c
+                tied := true
+            if l < c
+                strictLeft := true
+            if r < c
+                strictRight := true
+        else
+            if l < c or r < c
+                exceeded := true
+            if l == c or r == c
+                tied := true
+            if l > c
+                strictLeft := true
+            if r > c
+                strictRight := true
+    bool ok = not exceeded and strictLeft and strictRight
+    if tied and not ties
+        ok := false
+    ok
+
+//@function Stores a confirmed fractal, skipping a repeat of the same level from
+//          the same flat top/bottom, and trimming history to `keep`.
+pushFractal(array<Fractal> arr, float level, int bidx, int t, int keep, int gap) =>
+    bool dup = false
+    int n = array.size(arr)
+    if n > 0
+        Fractal last = array.get(arr, n - 1)
+        if last.level == level and bidx - last.barIndex <= gap
+            dup := true
+    if not dup
+        array.push(arr, Fractal.new(level = level, barIndex = bidx, tstamp = t, broken = false))
+        if array.size(arr) > keep
+            array.shift(arr)
+    not dup
+
+//@function Williams' protective stop: the SECOND-most-recent opposite fractal;
+//          if that sits closer to price than the most recent one, whichever of
+//          the two is furthest from price. Falls back to the nearest opposite
+//          fractal still on the protective side when the literal rule lands on
+//          the wrong side of price (wiki log, 2026-08-29).
+stopFromFractals(array<Fractal> opp, float ref, int dir) =>
+    float result = na
+    int n = array.size(opp)
+    if n > 0
+        float f1 = array.get(opp, n - 1).level
+        float f2 = f1
+        if n > 1
+            f2 := array.get(opp, n - 2).level
+        float candidate = dir > 0 ? math.min(f1, f2) : math.max(f1, f2)
+        bool valid = dir > 0 ? candidate < ref : candidate > ref
+        if valid
+            result := candidate
+        else
+            for i = n - 1 to 0
+                float lvl = array.get(opp, i).level
+                bool ok = dir > 0 ? lvl < ref : lvl > ref
+                if ok
+                    result := lvl
+                    break
+    result
+
+var array<Fractal> upFractals = array.new<Fractal>()
+var array<Fractal> dnFractals = array.new<Fractal>()
+
+// Levels that were resting during THIS bar (set at the end of the previous bar)
+var float activeUp = na
+var float activeDn = na
+
+float buf = entryTicks * syminfo.mintick
+float restingBuyPrev = na(activeUp) ? na : activeUp + buf
+float restingSellPrev = na(activeDn) ? na : activeDn - buf
+
+// --- Retire fractals this bar traded through ------------------------------
+for f in upFractals
+    if not f.broken and high >= f.level + buf
+        f.broken := true
+for f in dnFractals
+    if not f.broken and low <= f.level - buf
+        f.broken := true
+
+// --- Store fractals confirmed on this bar ---------------------------------
+bool rawUp = detectFractal(fractalLen, true, allowTies)
+bool rawDn = detectFractal(fractalLen, false, allowTies)
+
+bool newUpFrac = false
+bool newDnFrac = false
+if rawUp
+    newUpFrac := pushFractal(upFractals, high[fractalLen], bar_index - fractalLen, time[fractalLen], maxStored, fractalLen)
+if rawDn
+    newDnFrac := pushFractal(dnFractals, low[fractalLen], bar_index - fractalLen, time[fractalLen], maxStored, fractalLen)
+
+// --- Refresh the levels the orders will rest at through the NEXT bar ------
+activeUp := na
+activeDn := na
+for f in upFractals
+    if not f.broken
+        activeUp := f.level
+for f in dnFractals
+    if not f.broken
+        activeDn := f.level
+
+float restingBuy = na(activeUp) ? na : activeUp + buf
+float restingSell = na(activeDn) ? na : activeDn - buf
+
+// ===========================================================================
+// THE FIVE DIMENSIONS
+// ===========================================================================
+
+// 2. Balance line - every smoothing runs on every bar so ta.* state stays
+//    consistent; the displayed value is the one computed `blOffset` bars ago.
+float blRma = ta.rma(blSrc, blLen)
+float blSma = ta.sma(blSrc, blLen)
+float blEma = ta.ema(blSrc, blLen)
+float blRaw = blType == "SMA" ? blSma : blType == "EMA" ? blEma : blRma
+float blDisp = blRaw[blOffset]
+
+// 3. Momentum: 5/34 SIMPLE moving-average difference
+float ao = ta.sma(aoSrc, aoFast) - ta.sma(aoSrc, aoSlow)
+
+// 5. Accelerator
+float aoAvg = ta.sma(ao, acLen)
+float ac = acMode == "SMA(AO, 5)" ? aoAvg : ao - aoAvg
+
+// 1. Fractal dimension: direction of the most recent fractal breakout
+bool brokeUp = not na(restingBuyPrev) and high >= restingBuyPrev
+bool brokeDn = not na(restingSellPrev) and low <= restingSellPrev
+var int lastBreakDir = 0
+if brokeUp and brokeDn
+    lastBreakDir := close >= open ? 1 : -1
+else if brokeUp
+    lastBreakDir := 1
+else if brokeDn
+    lastBreakDir := -1
+
+bool dimFractal = lastBreakDir > 0
+bool dimBalance = not na(blDisp) and close > blDisp
+bool dimMomentum = ao > 0
+bool dimMomDir = ao > ao[1]
+bool dimAccel = acUseSlope ? ac > ac[1] : ac > 0
+
+int bullDims = (dimFractal ? 1 : 0) + (dimBalance ? 1 : 0) + (dimMomentum ? 1 : 0) + (dimMomDir ? 1 : 0) + (dimAccel ? 1 : 0)
+int bearDims = 5 - bullDims
+
+bool longFilterOk = (not useBalFilter or dimBalance) and
+     (not useMomFilter or dimMomentum) and
+     (not useMomDirFilter or dimMomDir) and
+     (not useAccFilter or dimAccel)
+
+bool shortFilterOk = (not useBalFilter or not dimBalance) and
+     (not useMomFilter or not dimMomentum) and
+     (not useMomDirFilter or not dimMomDir) and
+     (not useAccFilter or not dimAccel)
+
+// ===========================================================================
+// TRADERSPOST ALERT PAYLOADS
+// ===========================================================================
+
+string tickerField = tpTicker == "" ? syminfo.ticker : tpTicker
+string qtyField = tpQty == "" ? "" : ",\"quantity\":" + tpQty
+string buyMsg = "{\"ticker\":\"" + tickerField + "\",\"action\":\"buy\",\"sentiment\":\"long\"" + qtyField + "}"
+string sellMsg = "{\"ticker\":\"" + tickerField + "\",\"action\":\"sell\",\"sentiment\":\"short\"" + qtyField + "}"
+string exitLongMsg = "{\"ticker\":\"" + tickerField + "\",\"action\":\"sell\",\"sentiment\":\"flat\"}"
+string exitShortMsg = "{\"ticker\":\"" + tickerField + "\",\"action\":\"buy\",\"sentiment\":\"flat\"}"
+
+// ===========================================================================
+// ORDER MANAGEMENT
+// ===========================================================================
+
+bool inWindow = not useDateFilter or (time >= startDate and time <= endDate)
+
+float posSize = strategy.position_size
+bool isLong = posSize > 0
+bool isShort = posSize < 0
+bool flat = posSize == 0
+
+// Units already on: every entry is exactly `qtyPerUnit`, so this is the count.
+int units = int(math.round(math.abs(posSize) / qtyPerUnit))
+
+bool longBlockedByPos = isShort and not allowReverse
+bool shortBlockedByPos = isLong and not allowReverse
+bool longRoom = flat or isShort or units < maxUnits
+bool shortRoom = flat or isLong or units < maxUnits
+
+bool placeLong = allowLongs and inWindow and longFilterOk and longRoom and
+     not longBlockedByPos and not na(restingBuy) and restingBuy > close
+bool placeShort = allowShorts and inWindow and shortFilterOk and shortRoom and
+     not shortBlockedByPos and not na(restingSell) and restingSell < close
+
+// One pending order per side at a time: the id carries the unit number so each
+// add is identifiable in the strategy tester.
+int longIdx = isLong ? units + 1 : 1
+int shortIdx = isShort ? units + 1 : 1
+string longId = "L" + str.tostring(longIdx)
+string shortId = "S" + str.tostring(shortIdx)
+
+// Clear every stale resting order on both sides before (re)placing
+for i = 1 to maxUnits + 1
+    if not placeLong or i != longIdx
+        strategy.cancel("L" + str.tostring(i))
+    if not placeShort or i != shortIdx
+        strategy.cancel("S" + str.tostring(i))
+
+if placeLong
+    strategy.entry(longId, strategy.long, qty=qtyPerUnit, stop=restingBuy,
+         comment="BW long unit " + str.tostring(longIdx), alert_message=buyMsg)
+if placeShort
+    strategy.entry(shortId, strategy.short, qty=qtyPerUnit, stop=restingSell,
+         comment="BW short unit " + str.tostring(shortIdx), alert_message=sellMsg)
+
+// --- Protective stop ------------------------------------------------------
+float atrVal = ta.atr(atrLen)
+float rawLongStop = stopFromFractals(dnFractals, close, 1)
+float rawShortStop = stopFromFractals(upFractals, close, -1)
+
+var float curStop = na
+bool flippedLong = isLong and posSize[1] <= 0
+bool flippedShort = isShort and posSize[1] >= 0
+
+if flat
+    curStop := na
+else if isLong
+    float base = na(rawLongStop) ? close - atrMult * atrVal : rawLongStop
+    if flippedLong or na(curStop)
+        curStop := base
+    else if trailStops
+        curStop := math.max(curStop, base)
+else if isShort
+    float base = na(rawShortStop) ? close + atrMult * atrVal : rawShortStop
+    if flippedShort or na(curStop)
+        curStop := base
+    else if trailStops
+        curStop := math.min(curStop, base)
+
+float avgPrice = strategy.position_avg_price
+float riskPerUnit = na(curStop) ? na : math.abs(avgPrice - curStop)
+float longTarget = useTarget and not na(riskPerUnit) ? avgPrice + targetR * riskPerUnit : na
+float shortTarget = useTarget and not na(riskPerUnit) ? avgPrice - targetR * riskPerUnit : na
+
+if isLong and not na(curStop)
+    strategy.exit("BW exit L", stop=curStop, limit=longTarget,
+         comment="BW stop/target", alert_message=exitLongMsg)
+if isShort and not na(curStop)
+    strategy.exit("BW exit S", stop=curStop, limit=shortTarget,
+         comment="BW stop/target", alert_message=exitShortMsg)
+
+// --- Five magic bullets: every dimension standing against the position ----
+bool bulletsAgainstLong = isLong and bearDims >= bulletsRequired
+bool bulletsAgainstShort = isShort and bullDims >= bulletsRequired
+
+if useBulletExit and bulletsAgainstLong
+    strategy.close_all(comment="Five magic bullets", alert_message=exitLongMsg)
+if useBulletExit and bulletsAgainstShort
+    strategy.close_all(comment="Five magic bullets", alert_message=exitShortMsg)
+
+// --- Flatten when the backtest window closes ------------------------------
+if useDateFilter and time > endDate and not flat
+    strategy.close_all(comment="Outside backtest window")
+
+// ===========================================================================
+// PLOTS - price-chart layer (force_overlay lifts these out of the home pane)
+// ===========================================================================
+
+plotshape(showFractals and newUpFrac, title="Up fractal",
+     style=shape.triangleup, location=location.abovebar, color=upCol,
+     size=size.tiny, offset=-fractalLen, force_overlay=true)
+plotshape(showFractals and newDnFrac, title="Down fractal",
+     style=shape.triangledown, location=location.belowbar, color=dnCol,
+     size=size.tiny, offset=-fractalLen, force_overlay=true)
+
+plot(showLevels and placeLong ? restingBuy : na, "Resting buy stop",
+     color=color.new(upCol, 25), style=plot.style_linebr,
+     linestyle=plot.linestyle_dashed, force_overlay=true)
+plot(showLevels and placeShort ? restingSell : na, "Resting sell stop",
+     color=color.new(dnCol, 25), style=plot.style_linebr,
+     linestyle=plot.linestyle_dashed, force_overlay=true)
+
+plot(showBalance ? blRaw : na, "Balance line", color=balCol, linewidth=2,
+     offset=blOffset, force_overlay=true)
+
+plot(showStop ? curStop : na, "Protective stop", color=stopCol,
+     style=plot.style_linebr, linewidth=2, force_overlay=true)
+
+bgcolor(bulletsAgainstLong ? color.new(dnCol, 88) : na, title="Magic bullets vs long", force_overlay=true)
+bgcolor(bulletsAgainstShort ? color.new(upCol, 88) : na, title="Magic bullets vs short", force_overlay=true)
+
+// ===========================================================================
+// PLOTS - oscillator pane (dimensions 3, 4 and 5)
+// ===========================================================================
+
+color aoCol = ao > ao[1] ? color.new(upCol, 25) : color.new(dnCol, 25)
+color acCol = ac > ac[1] ? color.new(upCol, 55) : color.new(dnCol, 55)
+
+plot(showMom ? ao : na, "Momentum 5/34", color=aoCol, style=plot.style_columns)
+plot(showAcc ? ac : na, "Accelerator", color=acCol, style=plot.style_histogram, linewidth=2)
+hline(0, "Zero", color=color.new(color.gray, 40), linestyle=hline.style_dotted)

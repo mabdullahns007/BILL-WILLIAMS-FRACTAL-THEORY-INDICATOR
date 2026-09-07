@@ -1,0 +1,433 @@
+// built with PineScript Agents by TradersPost
+//@version=6
+//
+// Bill Williams - Fractal Theory / Five Dimensions of Market Structure
+// ===========================================================================
+// Rules sourced from the OKF knowledge bundle `OKF/fractal-theory`, ingested
+// from Bill Williams' talk "The Practical Fractal: The Holy Grail to Trading"
+// (https://www.youtube.com/watch?v=bNxt298VVOw).
+//
+// THE FIVE DIMENSIONS  (concepts/five-dimensions-of-market-structure.md)
+//   1. Fractal       - the "five-fingered boogie": a minimum of 5 bars whose
+//                      centre bar is higher than the two bars either side of
+//                      it (mirror image for a down fractal). Entry = buy stop
+//                      one tick above a confirmed up fractal / sell stop one
+//                      tick below a confirmed down fractal.
+//   2. Balance line  - 13-bar smoothed MA offset 8 bars FORWARD, the "strange
+//                      attractor": where price would sit with no new
+//                      information, so distance from it = new information.
+//   3. Momentum      - 5-bar minus 34-bar SIMPLE MA histogram. Williams is
+//                      explicit that these must be simple, not exponential.
+//   4. Momentum dir  - whether that histogram is rising or falling.
+//   5. Accelerator   - the 5-bar MA layer on momentum. Acceleration changes
+//                      before momentum, which changes before price.
+//
+// FIVE MAGIC BULLETS (concepts/five-magic-bullets.md) - all five dimensions
+// reversing at once; the signal Williams says reliably kills a trend.
+//
+// STOP PLACEMENT (concepts/stop-placement-rule.md) - the second-most-recent
+// opposite fractal; if that one sits CLOSER to price than the most recent
+// one, use whichever of the two is furthest from price.
+//
+// TWO PLACES THE SOURCE IS AMBIGUOUS, AND WHAT THIS SCRIPT DOES:
+//   * The wiki describes the accelerator as "a 5-bar moving average of the
+//     momentum oscillator". Williams' published Accelerator is AO - SMA(AO,5).
+//     Both are selectable; the published form is the default.
+//   * The wiki's fractal definition allows tied/extra bars "provided nothing
+//     in the two-bar window on either side exceeds the centre bar". That is
+//     the default (Allow ties); a strict pivot mode is also provided.
+//   * The squat / green / fade / fake bar classification is NAMED but never
+//     defined in the source talk, so it is deliberately not implemented here
+//     rather than guessed at.
+//
+// PANE LAYOUT: this script's home pane is the oscillator pane (momentum +
+// accelerator). Everything belonging on price - fractal markers, balance
+// line, entry-stop levels, protective-stop levels, signals - is force-
+// overlaid onto the main chart.
+//
+// REPAINTING: fractals confirm N bars after their centre bar and never move
+// once confirmed. Breakout signals fire intrabar by default (that is what a
+// resting stop order does); enable "Confirm break on bar close" for
+// close-only, non-intrabar signals.
+// ===========================================================================
+
+indicator("[TradersPost] BW Fractal Theory - 5 Dimensions",
+     shorttitle="BW Fractals",
+     overlay=false,
+     max_bars_back=500)
+
+// ===========================================================================
+// INPUTS
+// ===========================================================================
+
+grpFrac = "1. Fractals (space dimension)"
+fractalLen = input.int(2, "Bars either side of the fractal",
+     minval=1, maxval=20, group=grpFrac,
+     tooltip="Williams' fractal is the 5-bar 'five-fingered boogie': 2 bars either side of the centre bar. Raising this makes fractals rarer and slower to confirm.")
+allowTies = input.bool(true, "Allow tied / extra bars",
+     group=grpFrac,
+     tooltip="ON (source-faithful): a fractal is valid as long as nothing in the window on either side EXCEEDS the centre bar, so equal highs/lows still qualify. OFF: strict pivot - the centre bar must be strictly beyond every bar in the window.")
+entryTicks = input.int(1, "Entry buffer (ticks beyond the fractal)",
+     minval=0, maxval=100, group=grpFrac,
+     tooltip="Williams places the stop order one tick beyond the fractal.")
+maxStored = input.int(50, "Fractals kept per side",
+     minval=4, maxval=200, group=grpFrac,
+     tooltip="How much fractal history to retain for the stop-placement rule.")
+
+grpBal = "2. Balance line (strange attractor)"
+blSrc = input.source(hl2, "Balance line source", group=grpBal)
+blLen = input.int(13, "Balance line length", minval=1, maxval=200, group=grpBal)
+blOffset = input.int(8, "Forward offset (bars)", minval=0, maxval=100, group=grpBal,
+     tooltip="Williams pushes the 13-bar average 8 bars into the future. Signal logic compares price against the value DISPLAYED at the current bar (i.e. computed 8 bars ago).")
+blType = input.string("SMMA (RMA)", "Smoothing",
+     options=["SMMA (RMA)", "SMA", "EMA"], group=grpBal,
+     tooltip="The talk says 'smoothed moving average', which is the SMMA/RMA used by Williams' later Alligator lines.")
+
+grpMom = "3-5. Momentum & accelerator"
+aoSrc = input.source(hl2, "Oscillator source", group=grpMom)
+aoFast = input.int(5, "Momentum fast SMA", minval=1, maxval=100, group=grpMom)
+aoSlow = input.int(34, "Momentum slow SMA", minval=2, maxval=300, group=grpMom)
+acMode = input.string("AO - SMA(AO, 5)", "Accelerator formula",
+     options=["AO - SMA(AO, 5)", "SMA(AO, 5)"], group=grpMom,
+     tooltip="'AO - SMA(AO,5)' is Williams' published Accelerator. 'SMA(AO,5)' is the literal reading of the talk's wording. See the header note.")
+acLen = input.int(5, "Accelerator length", minval=1, maxval=100, group=grpMom)
+acUseSlope = input.bool(false, "Judge accelerator by slope, not zero line",
+     group=grpMom,
+     tooltip="OFF: the accelerator dimension is bullish above zero. ON: bullish while rising.")
+
+grpSig = "Signal filters"
+allowLongs = input.bool(true, "Long signals", group=grpSig, inline="dir")
+allowShorts = input.bool(true, "Short signals", group=grpSig, inline="dir")
+confirmOnClose = input.bool(false, "Confirm break on bar close", group=grpSig,
+     tooltip="OFF: signal the moment price trades through the fractal (what a resting stop order does). ON: require a close beyond it.")
+useBalFilter = input.bool(true, "Require balance-line agreement", group=grpSig,
+     tooltip="Longs only while price is above the displayed balance line; shorts only below.")
+useMomFilter = input.bool(false, "Require momentum agreement", group=grpSig,
+     tooltip="Longs only while the 5/34 histogram is above zero; shorts only below.")
+useMomDirFilter = input.bool(false, "Require momentum DIRECTION agreement", group=grpSig,
+     tooltip="Longs only while the histogram is rising; shorts only while falling.")
+useAccFilter = input.bool(false, "Require accelerator agreement", group=grpSig)
+
+grpBullets = "Five magic bullets"
+bulletsRequired = input.int(5, "Dimensions that must reverse", minval=2, maxval=5,
+     group=grpBullets,
+     tooltip="Williams' signal is all five reversing together. Lower it to fire on partial reversals.")
+
+grpVis = "Display"
+showFractals = input.bool(true, "Fractal markers", group=grpVis)
+showLevels = input.bool(true, "Entry stop levels", group=grpVis)
+showBalance = input.bool(true, "Balance line", group=grpVis)
+showStops = input.bool(true, "Protective stop levels", group=grpVis)
+showSignals = input.bool(true, "Breakout signals", group=grpVis)
+showBullets = input.bool(true, "Shade magic-bullet reversals", group=grpVis)
+showMom = input.bool(true, "Momentum histogram", group=grpVis)
+showAcc = input.bool(true, "Accelerator histogram", group=grpVis)
+showPanel = input.bool(false, "Five-dimension panel", group=grpVis,
+     tooltip="Small table on the price chart showing the current state of each of the five dimensions.")
+panelPos = input.string("top_right", "Panel position",
+     options=["top_left", "top_center", "top_right", "middle_left", "middle_right", "bottom_left", "bottom_center", "bottom_right"],
+     group=grpVis, active=showPanel)
+
+grpCol = "Colors"
+upCol = input.color(color.new(#26a69a, 0), "Bullish", group=grpCol, inline="c1")
+dnCol = input.color(color.new(#ef5350, 0), "Bearish", group=grpCol, inline="c1")
+balCol = input.color(color.new(#2962ff, 0), "Balance line", group=grpCol)
+stopCol = input.color(color.new(#ff9800, 0), "Protective stop", group=grpCol)
+
+// ===========================================================================
+// TYPES
+// ===========================================================================
+
+// A confirmed fractal. `tstamp` is stored alongside `barIndex` so downstream
+// tooling can address it by time (no 5000-bar lookback ceiling).
+type Fractal
+    float level
+    int   barIndex
+    int   tstamp
+    bool  broken
+
+// ===========================================================================
+// FRACTAL ENGINE
+// ===========================================================================
+
+//@function Tests whether a fractal completed `len` bars back.
+//@param len   bars either side of the centre bar
+//@param up    true = up fractal (highs), false = down fractal (lows)
+//@param ties  allow tied bars in the window (source-faithful) or demand a strict pivot
+detectFractal(int len, bool up, bool ties) =>
+    float c = up ? high[len] : low[len]
+    bool exceeded = false
+    bool tied = false
+    bool strictLeft = false
+    bool strictRight = false
+    for i = 1 to len
+        float l = up ? high[len + i] : low[len + i]
+        float r = up ? high[len - i] : low[len - i]
+        if up
+            if l > c or r > c
+                exceeded := true
+            if l == c or r == c
+                tied := true
+            if l < c
+                strictLeft := true
+            if r < c
+                strictRight := true
+        else
+            if l < c or r < c
+                exceeded := true
+            if l == c or r == c
+                tied := true
+            if l > c
+                strictLeft := true
+            if r > c
+                strictRight := true
+    bool ok = not exceeded and strictLeft and strictRight
+    if tied and not ties
+        ok := false
+    ok
+
+//@function Stores a confirmed fractal, skipping a repeat of the same level from
+//          the same flat top/bottom, and trimming history to `keep`.
+//@returns  true when a new fractal was actually stored
+pushFractal(array<Fractal> arr, float level, int bidx, int t, int keep, int gap) =>
+    bool dup = false
+    int n = array.size(arr)
+    if n > 0
+        Fractal last = array.get(arr, n - 1)
+        if last.level == level and bidx - last.barIndex <= gap
+            dup := true
+    if not dup
+        array.push(arr, Fractal.new(level = level, barIndex = bidx, tstamp = t, broken = false))
+        if array.size(arr) > keep
+            array.shift(arr)
+    not dup
+
+//@function Williams' protective stop: the SECOND-most-recent opposite fractal;
+//          if that sits closer to price than the most recent one, take whichever
+//          of the two is furthest from price.
+//          Fallback (logged in the wiki on 2026-08-29): in chop the literal rule
+//          can land on the wrong side of price, so walk back to the nearest
+//          opposite fractal that is still on the protective side.
+//@param dir +1 for a long position, -1 for a short
+stopFromFractals(array<Fractal> opp, float ref, int dir) =>
+    float result = na
+    int n = array.size(opp)
+    if n > 0
+        float f1 = array.get(opp, n - 1).level
+        float f2 = f1
+        if n > 1
+            f2 := array.get(opp, n - 2).level
+        float candidate = dir > 0 ? math.min(f1, f2) : math.max(f1, f2)
+        bool valid = dir > 0 ? candidate < ref : candidate > ref
+        if valid
+            result := candidate
+        else
+            for i = n - 1 to 0
+                float lvl = array.get(opp, i).level
+                bool ok = dir > 0 ? lvl < ref : lvl > ref
+                if ok
+                    result := lvl
+                    break
+    result
+
+var array<Fractal> upFractals = array.new<Fractal>()
+var array<Fractal> dnFractals = array.new<Fractal>()
+
+// Entry-stop levels carried in from the previous bar - a resting order can only
+// sit at a level that already existed when the bar opened.
+var float activeUp = na
+var float activeDn = na
+
+float buf = entryTicks * syminfo.mintick
+float buyStop = na(activeUp) ? na : activeUp + buf
+float sellStop = na(activeDn) ? na : activeDn - buf
+
+// --- 1. Did this bar take out the resting level? --------------------------
+bool longBreak = false
+bool shortBreak = false
+if not na(buyStop)
+    longBreak := confirmOnClose ? close > buyStop : high >= buyStop
+if not na(sellStop)
+    shortBreak := confirmOnClose ? close < sellStop : low <= sellStop
+
+// --- 2. Retire fractals this bar traded through ---------------------------
+for f in upFractals
+    if not f.broken and high >= f.level + buf
+        f.broken := true
+for f in dnFractals
+    if not f.broken and low <= f.level - buf
+        f.broken := true
+
+// --- 3. Store fractals confirmed on this bar ------------------------------
+bool rawUp = detectFractal(fractalLen, true, allowTies)
+bool rawDn = detectFractal(fractalLen, false, allowTies)
+
+bool newUpFrac = false
+bool newDnFrac = false
+if rawUp
+    newUpFrac := pushFractal(upFractals, high[fractalLen], bar_index - fractalLen, time[fractalLen], maxStored, fractalLen)
+if rawDn
+    newDnFrac := pushFractal(dnFractals, low[fractalLen], bar_index - fractalLen, time[fractalLen], maxStored, fractalLen)
+
+// --- 4. Refresh the resting levels for the next bar -----------------------
+activeUp := na
+activeDn := na
+for f in upFractals
+    if not f.broken
+        activeUp := f.level
+for f in dnFractals
+    if not f.broken
+        activeDn := f.level
+
+// ===========================================================================
+// THE FIVE DIMENSIONS
+// ===========================================================================
+
+// 2. Balance line - all three smoothings run every bar so ta.* state stays
+//    consistent; the displayed value is the one computed `blOffset` bars ago.
+float blRma = ta.rma(blSrc, blLen)
+float blSma = ta.sma(blSrc, blLen)
+float blEma = ta.ema(blSrc, blLen)
+float blRaw = blType == "SMA" ? blSma : blType == "EMA" ? blEma : blRma
+float blDisp = blRaw[blOffset]
+
+// 3. Momentum: 5/34 SIMPLE moving-average difference
+float ao = ta.sma(aoSrc, aoFast) - ta.sma(aoSrc, aoSlow)
+
+// 5. Accelerator
+float aoAvg = ta.sma(ao, acLen)
+float ac = acMode == "SMA(AO, 5)" ? aoAvg : ao - aoAvg
+
+// 1. Fractal dimension: the direction of the most recent fractal breakout
+var int lastBreakDir = 0
+if longBreak and shortBreak
+    lastBreakDir := close >= open ? 1 : -1
+else if longBreak
+    lastBreakDir := 1
+else if shortBreak
+    lastBreakDir := -1
+
+bool dimFractal = lastBreakDir > 0
+bool dimBalance = not na(blDisp) and close > blDisp
+bool dimMomentum = ao > 0
+bool dimMomDir = ao > ao[1]
+bool dimAccel = acUseSlope ? ac > ac[1] : ac > 0
+
+int bullDims = (dimFractal ? 1 : 0) + (dimBalance ? 1 : 0) + (dimMomentum ? 1 : 0) + (dimMomDir ? 1 : 0) + (dimAccel ? 1 : 0)
+int bearDims = 5 - bullDims
+
+// Five magic bullets: the dimensions flipping together, not merely sitting flipped
+bool magicBull = bullDims >= bulletsRequired and bullDims[1] < bulletsRequired
+bool magicBear = bearDims >= bulletsRequired and bearDims[1] < bulletsRequired
+
+// ===========================================================================
+// SIGNALS
+// ===========================================================================
+
+bool longFilterOk = (not useBalFilter or dimBalance) and
+     (not useMomFilter or dimMomentum) and
+     (not useMomDirFilter or dimMomDir) and
+     (not useAccFilter or dimAccel)
+
+bool shortFilterOk = (not useBalFilter or not dimBalance) and
+     (not useMomFilter or not dimMomentum) and
+     (not useMomDirFilter or not dimMomDir) and
+     (not useAccFilter or not dimAccel)
+
+bool longSignal = allowLongs and longBreak and longFilterOk
+bool shortSignal = allowShorts and shortBreak and shortFilterOk
+
+// Protective stops per the two-fractals-back rule
+float longStopLevel = stopFromFractals(dnFractals, close, 1)
+float shortStopLevel = stopFromFractals(upFractals, close, -1)
+
+// ===========================================================================
+// PLOTS - price-chart layer (force_overlay lifts these out of the home pane)
+// ===========================================================================
+
+plotshape(showFractals and newUpFrac, title="Up fractal",
+     style=shape.triangleup, location=location.abovebar, color=upCol,
+     size=size.tiny, offset=-fractalLen, force_overlay=true)
+plotshape(showFractals and newDnFrac, title="Down fractal",
+     style=shape.triangledown, location=location.belowbar, color=dnCol,
+     size=size.tiny, offset=-fractalLen, force_overlay=true)
+
+plot(showLevels ? buyStop : na, "Buy stop (up fractal + buffer)",
+     color=color.new(upCol, 25), style=plot.style_linebr, linewidth=1,
+     linestyle=plot.linestyle_dashed, force_overlay=true)
+plot(showLevels ? sellStop : na, "Sell stop (down fractal - buffer)",
+     color=color.new(dnCol, 25), style=plot.style_linebr, linewidth=1,
+     linestyle=plot.linestyle_dashed, force_overlay=true)
+
+plot(showBalance ? blRaw : na, "Balance line", color=balCol, linewidth=2,
+     offset=blOffset, force_overlay=true)
+
+plot(showStops ? longStopLevel : na, "Long stop (2 fractals back)",
+     color=color.new(stopCol, 40), style=plot.style_linebr,
+     linestyle=plot.linestyle_dotted, force_overlay=true)
+plot(showStops ? shortStopLevel : na, "Short stop (2 fractals back)",
+     color=color.new(stopCol, 40), style=plot.style_linebr,
+     linestyle=plot.linestyle_dotted, force_overlay=true)
+
+plotshape(showSignals and longSignal, title="Long breakout",
+     style=shape.labelup, location=location.belowbar, color=upCol,
+     text="B", textcolor=color.white, size=size.tiny, force_overlay=true)
+plotshape(showSignals and shortSignal, title="Short breakout",
+     style=shape.labeldown, location=location.abovebar, color=dnCol,
+     text="S", textcolor=color.white, size=size.tiny, force_overlay=true)
+
+bgcolor(showBullets and magicBull ? color.new(upCol, 88) : na, title="Magic bullets - bullish", force_overlay=true)
+bgcolor(showBullets and magicBear ? color.new(dnCol, 88) : na, title="Magic bullets - bearish", force_overlay=true)
+
+// ===========================================================================
+// PLOTS - oscillator pane (dimensions 3, 4 and 5)
+// ===========================================================================
+
+color aoCol = ao > ao[1] ? color.new(upCol, 25) : color.new(dnCol, 25)
+color acCol = ac > ac[1] ? color.new(upCol, 55) : color.new(dnCol, 55)
+
+plot(showMom ? ao : na, "Momentum 5/34", color=aoCol, style=plot.style_columns)
+plot(showAcc ? ac : na, "Accelerator", color=acCol, style=plot.style_histogram, linewidth=2)
+hline(0, "Zero", color=color.new(color.gray, 40), linestyle=hline.style_dotted)
+
+// ===========================================================================
+// FIVE-DIMENSION PANEL (off by default)
+// ===========================================================================
+
+stateText(bool bullish) =>
+    bullish ? "UP" : "DOWN"
+
+if showPanel and barstate.islast
+    var table panel = table.new(position.top_right, 2, 7, border_width=1, force_overlay=true)
+    table.clear(panel, 0, 0, 1, 6)
+    table.cell(panel, 0, 0, "Five dimensions", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    table.cell(panel, 1, 0, str.tostring(bullDims) + " / 5 up", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
+    table.cell(panel, 0, 1, "1 Fractal", text_size=size.small)
+    table.cell(panel, 1, 1, stateText(dimFractal), text_color=color.white, bgcolor=dimFractal ? upCol : dnCol, text_size=size.small)
+    table.cell(panel, 0, 2, "2 Balance line", text_size=size.small)
+    table.cell(panel, 1, 2, stateText(dimBalance), text_color=color.white, bgcolor=dimBalance ? upCol : dnCol, text_size=size.small)
+    table.cell(panel, 0, 3, "3 Momentum", text_size=size.small)
+    table.cell(panel, 1, 3, stateText(dimMomentum), text_color=color.white, bgcolor=dimMomentum ? upCol : dnCol, text_size=size.small)
+    table.cell(panel, 0, 4, "4 Momentum dir", text_size=size.small)
+    table.cell(panel, 1, 4, stateText(dimMomDir), text_color=color.white, bgcolor=dimMomDir ? upCol : dnCol, text_size=size.small)
+    table.cell(panel, 0, 5, "5 Accelerator", text_size=size.small)
+    table.cell(panel, 1, 5, stateText(dimAccel), text_color=color.white, bgcolor=dimAccel ? upCol : dnCol, text_size=size.small)
+    table.cell(panel, 0, 6, "Stop (2 back)", text_size=size.small)
+    string stopTxt = dimFractal ? str.tostring(longStopLevel, format.mintick) : str.tostring(shortStopLevel, format.mintick)
+    table.cell(panel, 1, 6, stopTxt, text_size=size.small)
+    table.set_position(panel, panelPos)
+
+// ===========================================================================
+// ALERTS
+// ===========================================================================
+
+alertcondition(longSignal, title="BW long fractal breakout",
+     message="Bill Williams up-fractal breakout on {{ticker}} at {{close}}")
+alertcondition(shortSignal, title="BW short fractal breakout",
+     message="Bill Williams down-fractal breakout on {{ticker}} at {{close}}")
+alertcondition(magicBull, title="BW five magic bullets - bullish",
+     message="Five magic bullets turned UP on {{ticker}} at {{close}}")
+alertcondition(magicBear, title="BW five magic bullets - bearish",
+     message="Five magic bullets turned DOWN on {{ticker}} at {{close}}")
+alertcondition(newUpFrac or newDnFrac, title="BW new fractal confirmed",
+     message="New fractal confirmed on {{ticker}}")
